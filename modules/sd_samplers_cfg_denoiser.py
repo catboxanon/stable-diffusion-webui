@@ -67,13 +67,20 @@ class CFGDenoiser(torch.nn.Module):
         raise NotImplementedError()
 
     def combine_denoised(self, x_out, conds_list, uncond, cond_scale):
-        denoised_uncond = x_out[-uncond.shape[0]:]
-        denoised = torch.clone(denoised_uncond)
-
-        for i, conds in enumerate(conds_list):
-            for cond_index, weight in conds:
-                denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
-
+        if isinstance(x_out, list):
+            # If x_out is a list of tensors (LoRA composite case)
+            denoised_uncond = torch.stack([x[-uncond.shape[0]:] for x in x_out], dim=0).mean(dim=0)
+            denoised = torch.clone(denoised_uncond)
+            for i, conds in enumerate(conds_list):
+                for cond_index, weight in conds:
+                    denoised[i] += (torch.stack([x[cond_index] for x in x_out], dim=0).mean(dim=0) - denoised_uncond[i]) * (weight * cond_scale)
+        else:
+            # If x_out is a single tensor
+            denoised_uncond = x_out[-uncond.shape[0]:]
+            denoised = torch.clone(denoised_uncond)
+            for i, conds in enumerate(conds_list):
+                for cond_index, weight in conds:
+                    denoised[i] += (x_out[cond_index] - denoised_uncond[i]) * (weight * cond_scale)
         return denoised
 
     def combine_denoised_for_edit_model(self, x_out, cond_scale):
@@ -149,6 +156,9 @@ class CFGDenoiser(torch.nn.Module):
         return cond, uncond
 
     def forward(self, x, sigma, uncond, cond, cond_scale, s_min_uncond, image_cond):
+        import importlib
+        lora_module = importlib.import_module("lora")
+
         if state.interrupted or state.skipped:
             raise sd_samplers_common.InterruptedException
 
@@ -225,6 +235,8 @@ class CFGDenoiser(torch.nn.Module):
         elif shared.opts.pad_cond_uncond and tensor.shape[1] != uncond.shape[1]:
             tensor, uncond = self.pad_cond_uncond(tensor, uncond)
 
+        x_outs = []
+
         if tensor.shape[1] == uncond.shape[1] or skip_uncond:
             if is_edit_model:
                 cond_in = catenate_conds([tensor, uncond, uncond])
@@ -234,7 +246,20 @@ class CFGDenoiser(torch.nn.Module):
                 cond_in = catenate_conds([tensor, uncond])
 
             if shared.opts.batch_cond_uncond:
-                x_out = self.inner_model(x_in, sigma_in, cond=make_condition_dict(cond_in, image_cond_in))
+                if True:  # set to false to return to default behavior
+                    for lora in lora_module.loaded_loras:
+                        for other_lora in lora_module.loaded_loras:
+                            if other_lora != lora:
+                                other_lora.te_multiplier = 0.0
+                                other_lora.unet_multiplier = 0.0
+                            else:
+                                other_lora.te_multiplier = 1.0
+                                other_lora.unet_multiplier = 1.0
+
+                        x_out = self.inner_model(x_in, sigma_in, cond=make_condition_dict(cond_in, image_cond_in))
+                        x_outs.append(x_out)
+                else:
+                    x_out = self.inner_model(x_in, sigma_in, cond=make_condition_dict(cond_in, image_cond_in))
             else:
                 x_out = torch.zeros_like(x_in)
                 for batch_offset in range(0, x_out.shape[0], batch_size):
@@ -273,7 +298,7 @@ class CFGDenoiser(torch.nn.Module):
         elif skip_uncond:
             denoised = self.combine_denoised(x_out, conds_list, uncond, 1.0)
         else:
-            denoised = self.combine_denoised(x_out, conds_list, uncond, cond_scale)
+            denoised = self.combine_denoised(x_outs if len(x_outs) > 0 else x_out, conds_list, uncond, cond_scale)
 
         # Blend in the original latents (after)
         if not self.mask_before_denoising and self.mask is not None:
